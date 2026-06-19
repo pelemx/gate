@@ -45,20 +45,22 @@ def wait_comfyui(timeout=180):
     raise RuntimeError("ComfyUI did not start in time")
 
 
-def wf_t2v(prompt, neg, w, h, frames, steps, cfg, seed):
-    # frames must satisfy: (frames - 1) % 8 == 0, minimum 9
+def fix_frames(frames):
     frames = max(9, frames)
     if (frames - 1) % 8 != 0:
         frames = ((frames - 1) // 8) * 8 + 1
+    return frames
+
+
+def wf_t2v(prompt, neg, w, h, frames, steps, cfg, seed):
+    frames = fix_frames(frames)
     return {
         "client_id": str(uuid.uuid4()),
         "prompt": {
-            # Load checkpoint (model + VAE)
             "1": {
                 "class_type": "CheckpointLoaderSimple",
                 "inputs": {"ckpt_name": CKPT_NAME}
             },
-            # Load text encoder (Gemma fp8) - needs both text_encoder and ckpt_name
             "2": {
                 "class_type": "LTXAVTextEncoderLoader",
                 "inputs": {
@@ -67,17 +69,14 @@ def wf_t2v(prompt, neg, w, h, frames, steps, cfg, seed):
                     "device": "default"
                 }
             },
-            # Encode positive prompt
             "3": {
                 "class_type": "CLIPTextEncode",
                 "inputs": {"clip": ["2", 0], "text": prompt}
             },
-            # Encode negative prompt
             "4": {
                 "class_type": "CLIPTextEncode",
                 "inputs": {"clip": ["2", 0], "text": neg}
             },
-            # LTX conditioning (adds frame_rate info)
             "5": {
                 "class_type": "LTXVConditioning",
                 "inputs": {
@@ -86,7 +85,6 @@ def wf_t2v(prompt, neg, w, h, frames, steps, cfg, seed):
                     "frame_rate": 25.0
                 }
             },
-            # Empty latent
             "6": {
                 "class_type": "EmptyLTXVLatentVideo",
                 "inputs": {
@@ -94,7 +92,6 @@ def wf_t2v(prompt, neg, w, h, frames, steps, cfg, seed):
                     "length": frames, "batch_size": 1
                 }
             },
-            # Sample
             "7": {
                 "class_type": "KSampler",
                 "inputs": {
@@ -108,17 +105,14 @@ def wf_t2v(prompt, neg, w, h, frames, steps, cfg, seed):
                     "denoise": 1.0
                 }
             },
-            # Decode VAE
             "8": {
                 "class_type": "VAEDecode",
                 "inputs": {"samples": ["7", 0], "vae": ["1", 2]}
             },
-            # IMAGE -> VIDEO
             "9": {
                 "class_type": "CreateVideo",
                 "inputs": {"images": ["8", 0], "fps": 25.0}
             },
-            # Save VIDEO
             "10": {
                 "class_type": "SaveVideo",
                 "inputs": {
@@ -133,9 +127,7 @@ def wf_t2v(prompt, neg, w, h, frames, steps, cfg, seed):
 
 
 def wf_i2v(prompt, neg, img, w, h, frames, steps, cfg, seed):
-    frames = max(9, frames)
-    if (frames - 1) % 8 != 0:
-        frames = ((frames - 1) // 8) * 8 + 1
+    frames = fix_frames(frames)
     return {
         "client_id": str(uuid.uuid4()),
         "prompt": {
@@ -167,48 +159,46 @@ def wf_i2v(prompt, neg, img, w, h, frames, steps, cfg, seed):
                     "frame_rate": 25.0
                 }
             },
-            # Load input image
-            "10": {
+            "6": {
                 "class_type": "LoadImage",
                 "inputs": {"image": img}
             },
-            # Image to video conditioning
-            "11": {
+            "7": {
                 "class_type": "LTXVImgToVideo",
                 "inputs": {
                     "positive": ["5", 0],
                     "negative": ["5", 1],
                     "vae": ["1", 2],
-                    "image": ["10", 0],
+                    "image": ["6", 0],
                     "width": w, "height": h,
                     "length": frames, "batch_size": 1
                 }
             },
-            "7": {
+            "8": {
                 "class_type": "KSampler",
                 "inputs": {
                     "model": ["1", 0],
-                    "positive": ["11", 0],
-                    "negative": ["11", 1],
-                    "latent_image": ["11", 2],
+                    "positive": ["7", 0],
+                    "negative": ["7", 1],
+                    "latent_image": ["7", 2],
                     "seed": seed, "steps": steps, "cfg": cfg,
                     "sampler_name": "euler",
                     "scheduler": "normal",
                     "denoise": 1.0
                 }
             },
-            "8": {
-                "class_type": "VAEDecode",
-                "inputs": {"samples": ["7", 0], "vae": ["1", 2]}
-            },
             "9": {
-                "class_type": "CreateVideo",
-                "inputs": {"images": ["8", 0], "fps": 25.0}
+                "class_type": "VAEDecode",
+                "inputs": {"samples": ["8", 0], "vae": ["1", 2]}
             },
-            "10b": {
+            "10": {
+                "class_type": "CreateVideo",
+                "inputs": {"images": ["9", 0], "fps": 25.0}
+            },
+            "11": {
                 "class_type": "SaveVideo",
                 "inputs": {
-                    "video": ["9", 0],
+                    "video": ["10", 0],
                     "filename_prefix": "ltx_i2v",
                     "format": "mp4",
                     "codec": "h264"
@@ -242,7 +232,9 @@ async def poll(prompt_id: str, job_id: str, timeout=900):
                     for node_out in hist.get("outputs", {}).values():
                         for key in ("videos", "gifs", "images"):
                             for item in node_out.get(key, []):
-                                p = OUTPUT_DIR / item.get("subfolder", "") / item.get("filename", "")
+                                subfolder = item.get("subfolder", "")
+                                fname = item.get("filename", "")
+                                p = OUTPUT_DIR / subfolder / fname if subfolder else OUTPUT_DIR / fname
                                 if p.exists():
                                     jobs[job_id].update(status="done", output=str(p))
                                     return
@@ -256,7 +248,7 @@ async def poll(prompt_id: str, job_id: str, timeout=900):
     jobs[job_id].update(status="error", error="timeout")
 
 
-app = FastAPI(title="LTX-2.3 Video API", version="2.0.0")
+app = FastAPI(title="LTX-2.3 Video API", version="2.1.0")
 
 
 @app.on_event("startup")
