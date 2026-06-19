@@ -46,34 +46,174 @@ def wait_comfyui(timeout=180):
 
 
 def wf_t2v(prompt, neg, w, h, frames, steps, cfg, seed):
+    # frames must satisfy: (frames - 1) % 8 == 0, minimum 9
+    frames = max(9, frames)
+    if (frames - 1) % 8 != 0:
+        frames = ((frames - 1) // 8) * 8 + 1
     return {
         "client_id": str(uuid.uuid4()),
         "prompt": {
-            "1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": CKPT_NAME}},
-            "2": {"class_type": "LTXAVTextEncoderLoader", "inputs": {"text_encoder": TE_NAME, "load_device": "offload_device"}},
-            "3": {"class_type": "LTXAVConditioningEncode", "inputs": {"clip": ["2", 0], "text": prompt, "width": w, "height": h, "frame_rate": 25, "length": frames}},
-            "4": {"class_type": "LTXAVConditioningEncode", "inputs": {"clip": ["2", 0], "text": neg, "width": w, "height": h, "frame_rate": 25, "length": frames}},
-            "5": {"class_type": "EmptyLTXVLatentVideo", "inputs": {"width": w, "height": h, "length": frames, "batch_size": 1}},
-            "6": {"class_type": "KSampler", "inputs": {"model": ["1", 0], "positive": ["3", 0], "negative": ["4", 0], "latent_image": ["5", 0], "seed": seed, "steps": steps, "cfg": cfg, "sampler_name": "euler", "scheduler": "ltv_linear_quadratic", "denoise": 1.0}},
-            "7": {"class_type": "VAEDecode", "inputs": {"samples": ["6", 0], "vae": ["1", 2]}},
-            "8": {"class_type": "VHS_VideoCombine", "inputs": {"images": ["7", 0], "frame_rate": 25, "loop_count": 0, "filename_prefix": "ltx_t2v", "format": "video/h264-mp4", "save_output": True}},
+            # Load checkpoint (model + VAE)
+            "1": {
+                "class_type": "CheckpointLoaderSimple",
+                "inputs": {"ckpt_name": CKPT_NAME}
+            },
+            # Load text encoder (Gemma fp8) - needs both text_encoder and ckpt_name
+            "2": {
+                "class_type": "LTXAVTextEncoderLoader",
+                "inputs": {
+                    "text_encoder": TE_NAME,
+                    "ckpt_name": CKPT_NAME,
+                    "device": "default"
+                }
+            },
+            # Encode positive prompt
+            "3": {
+                "class_type": "CLIPTextEncode",
+                "inputs": {"clip": ["2", 0], "text": prompt}
+            },
+            # Encode negative prompt
+            "4": {
+                "class_type": "CLIPTextEncode",
+                "inputs": {"clip": ["2", 0], "text": neg}
+            },
+            # LTX conditioning (adds frame_rate info)
+            "5": {
+                "class_type": "LTXVConditioning",
+                "inputs": {
+                    "positive": ["3", 0],
+                    "negative": ["4", 0],
+                    "frame_rate": 25.0
+                }
+            },
+            # Empty latent
+            "6": {
+                "class_type": "EmptyLTXVLatentVideo",
+                "inputs": {
+                    "width": w, "height": h,
+                    "length": frames, "batch_size": 1
+                }
+            },
+            # Sample
+            "7": {
+                "class_type": "KSampler",
+                "inputs": {
+                    "model": ["1", 0],
+                    "positive": ["5", 0],
+                    "negative": ["5", 1],
+                    "latent_image": ["6", 0],
+                    "seed": seed, "steps": steps, "cfg": cfg,
+                    "sampler_name": "euler",
+                    "scheduler": "normal",
+                    "denoise": 1.0
+                }
+            },
+            # Decode VAE
+            "8": {
+                "class_type": "VAEDecode",
+                "inputs": {"samples": ["7", 0], "vae": ["1", 2]}
+            },
+            # IMAGE -> VIDEO
+            "9": {
+                "class_type": "CreateVideo",
+                "inputs": {"images": ["8", 0], "fps": 25.0}
+            },
+            # Save VIDEO
+            "10": {
+                "class_type": "SaveVideo",
+                "inputs": {
+                    "video": ["9", 0],
+                    "filename_prefix": "ltx_t2v",
+                    "format": "mp4",
+                    "codec": "h264"
+                }
+            }
         }
     }
 
 
 def wf_i2v(prompt, neg, img, w, h, frames, steps, cfg, seed):
+    frames = max(9, frames)
+    if (frames - 1) % 8 != 0:
+        frames = ((frames - 1) // 8) * 8 + 1
     return {
         "client_id": str(uuid.uuid4()),
         "prompt": {
-            "1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": CKPT_NAME}},
-            "2": {"class_type": "LTXAVTextEncoderLoader", "inputs": {"text_encoder": TE_NAME, "load_device": "offload_device"}},
-            "10": {"class_type": "LoadImage", "inputs": {"image": img}},
-            "11": {"class_type": "LTXAVConditioningEncode", "inputs": {"clip": ["2", 0], "text": prompt, "width": w, "height": h, "frame_rate": 25, "length": frames}},
-            "12": {"class_type": "LTXAVConditioningEncode", "inputs": {"clip": ["2", 0], "text": neg, "width": w, "height": h, "frame_rate": 25, "length": frames}},
-            "13": {"class_type": "LTXVImgToVideoConditioning", "inputs": {"positive": ["11", 0], "negative": ["12", 0], "vae": ["1", 2], "image": ["10", 0], "width": w, "height": h, "length": frames, "batch_size": 1}},
-            "6": {"class_type": "KSampler", "inputs": {"model": ["1", 0], "positive": ["13", 0], "negative": ["13", 1], "latent_image": ["13", 2], "seed": seed, "steps": steps, "cfg": cfg, "sampler_name": "euler", "scheduler": "ltv_linear_quadratic", "denoise": 1.0}},
-            "7": {"class_type": "VAEDecode", "inputs": {"samples": ["6", 0], "vae": ["1", 2]}},
-            "8": {"class_type": "VHS_VideoCombine", "inputs": {"images": ["7", 0], "frame_rate": 25, "loop_count": 0, "filename_prefix": "ltx_i2v", "format": "video/h264-mp4", "save_output": True}},
+            "1": {
+                "class_type": "CheckpointLoaderSimple",
+                "inputs": {"ckpt_name": CKPT_NAME}
+            },
+            "2": {
+                "class_type": "LTXAVTextEncoderLoader",
+                "inputs": {
+                    "text_encoder": TE_NAME,
+                    "ckpt_name": CKPT_NAME,
+                    "device": "default"
+                }
+            },
+            "3": {
+                "class_type": "CLIPTextEncode",
+                "inputs": {"clip": ["2", 0], "text": prompt}
+            },
+            "4": {
+                "class_type": "CLIPTextEncode",
+                "inputs": {"clip": ["2", 0], "text": neg}
+            },
+            "5": {
+                "class_type": "LTXVConditioning",
+                "inputs": {
+                    "positive": ["3", 0],
+                    "negative": ["4", 0],
+                    "frame_rate": 25.0
+                }
+            },
+            # Load input image
+            "10": {
+                "class_type": "LoadImage",
+                "inputs": {"image": img}
+            },
+            # Image to video conditioning
+            "11": {
+                "class_type": "LTXVImgToVideo",
+                "inputs": {
+                    "positive": ["5", 0],
+                    "negative": ["5", 1],
+                    "vae": ["1", 2],
+                    "image": ["10", 0],
+                    "width": w, "height": h,
+                    "length": frames, "batch_size": 1
+                }
+            },
+            "7": {
+                "class_type": "KSampler",
+                "inputs": {
+                    "model": ["1", 0],
+                    "positive": ["11", 0],
+                    "negative": ["11", 1],
+                    "latent_image": ["11", 2],
+                    "seed": seed, "steps": steps, "cfg": cfg,
+                    "sampler_name": "euler",
+                    "scheduler": "normal",
+                    "denoise": 1.0
+                }
+            },
+            "8": {
+                "class_type": "VAEDecode",
+                "inputs": {"samples": ["7", 0], "vae": ["1", 2]}
+            },
+            "9": {
+                "class_type": "CreateVideo",
+                "inputs": {"images": ["8", 0], "fps": 25.0}
+            },
+            "10b": {
+                "class_type": "SaveVideo",
+                "inputs": {
+                    "video": ["9", 0],
+                    "filename_prefix": "ltx_i2v",
+                    "format": "mp4",
+                    "codec": "h264"
+                }
+            }
         }
     }
 
@@ -81,7 +221,8 @@ def wf_i2v(prompt, neg, img, w, h, frames, steps, cfg, seed):
 async def submit(wf: dict) -> str:
     async with httpx.AsyncClient() as c:
         r = await c.post(f"{COMFY_URL}/prompt", json=wf, timeout=30)
-        r.raise_for_status()
+        if r.status_code != 200:
+            raise Exception(f"{r.status_code}: {r.text}")
         return r.json()["prompt_id"]
 
 
@@ -115,7 +256,7 @@ async def poll(prompt_id: str, job_id: str, timeout=900):
     jobs[job_id].update(status="error", error="timeout")
 
 
-app = FastAPI(title="LTX-2.3 Video API", version="1.0.0")
+app = FastAPI(title="LTX-2.3 Video API", version="2.0.0")
 
 
 @app.on_event("startup")
@@ -150,8 +291,8 @@ async def t2v(
     prompt: str = Form(...),
     neg_prompt: str = Form(default=NEG),
     width: int = Form(default=768),
-    height: int = Form(default=432),
-    num_frames: int = Form(default=65),
+    height: int = Form(default=512),
+    num_frames: int = Form(default=25),
     steps: int = Form(default=20),
     cfg: float = Form(default=3.0),
     seed: int = Form(default=-1),
@@ -177,8 +318,8 @@ async def i2v(
     image: UploadFile = File(...),
     neg_prompt: str = Form(default=NEG),
     width: int = Form(default=768),
-    height: int = Form(default=432),
-    num_frames: int = Form(default=65),
+    height: int = Form(default=512),
+    num_frames: int = Form(default=25),
     steps: int = Form(default=20),
     cfg: float = Form(default=3.0),
     seed: int = Form(default=-1),
@@ -239,4 +380,4 @@ async def result(jid: str, bg: BackgroundTasks):
 
 
 if __name__ == "__main__":
-    uvicorn.run("api_ltx:app", host="0.0.0.0", port=API_PORT, log_level="info")
+    uvicorn.run("ltx_api:app", host="0.0.0.0", port=API_PORT, log_level="info")
